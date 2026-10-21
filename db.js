@@ -44,4 +44,12 @@ CREATE TABLE IF NOT EXISTS attendance (
 );
 `);
 
+db.exec(`CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  roll_no TEXT NOT NULL,
+  password_hash TEXT NOT NULL
+)`);
+
+
 module.exports = db;
