@@ -31,7 +31,7 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret";
 // Set COLLEGE_EMAIL_DOMAIN in .env (e.g. iiitdwd.ac.in). Email looks like 25bcs174@domain
 const EMAIL_DOMAIN = (process.env.COLLEGE_EMAIL_DOMAIN || "college.edu").replace(/\./g, "\\.");
-const EMAIL_RE = new RegExp(`^([a-z0-9]+)@${EMAIL_DOMAIN}$`, "i"); // group 1 = roll no
+const EMAIL_RE = new RegExp("^(\\d{2}[a-z]{3}\\d{3})@" + EMAIL_DOMAIN + "$", "i"); // group 1 = roll no
 
 // How often the QR code rotates (ms).
 const QR_ROTATE_INTERVAL_MS = 10_000;
@@ -142,7 +142,18 @@ const q = {
   endStaleSessions: db.prepare(
     "UPDATE sessions SET status = 'ended', ended_at = datetime('now') WHERE status = 'active'"
   ),
-  studentByRoll: db.prepare("SELECT id, roll_no, name FROM students WHERE roll_no = ?"),
+    // Any valid college-email roll no is accepted. Its student row is created automatically on first use.
+  studentByRoll: (() => {
+    const find = db.prepare("SELECT id, roll_no, name FROM students WHERE roll_no = ?");
+    const add = db.prepare("INSERT OR IGNORE INTO students (roll_no, name) VALUES (?, ?)");
+    return {
+      get(roll) {
+        const r = String(roll || "").trim().toUpperCase();
+        if (!r) return undefined;
+        return find.get(r) || (add.run(r, r), find.get(r));
+      },
+    };
+  })(),
   insertAttendance: db.prepare(
     "INSERT OR IGNORE INTO attendance (session_id, student_id) VALUES (?, ?)"
   ),
@@ -377,28 +388,286 @@ app.get("/auth/me", requireAuth, (req, res) => {
 
 // ---- Session / attendance routes -------------------------------------------
 
+// ---- Teacher accounts + courses + attendance routes ----
+
+// Only these teacher codes can create an account (same roster as teacherData.ts)
+const TEACHER_ROSTER = {
+  T101: "Prof. Sharma",
+  T102: "Prof. Rao",
+  T103: "Dr. Sunil P V",
+};
+
+// One-time schema additions (safe to run every start)
+try { db.exec("ALTER TABLE teachers ADD COLUMN password_hash TEXT"); } catch {}
+try { db.exec("ALTER TABLE sessions ADD COLUMN teacher_id INTEGER"); } catch {}
+try { db.exec("ALTER TABLE sessions ADD COLUMN course_name TEXT"); } catch {}
+try { db.exec("ALTER TABLE sessions ADD COLUMN course_section TEXT"); } catch {}
+try { db.exec("ALTER TABLE sessions ADD COLUMN hours REAL NOT NULL DEFAULT 1"); } catch {}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS teacher_courses (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    teacher_id INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    section    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(teacher_id, name, section)
+  );
+`);
+
+const SESSION_COLS = `s.id, s.started_at, s.ended_at, s.hours,
+  COALESCE(s.course_name, c.subject, c.code) AS course_name,
+  s.course_section AS section`;
+
+const tq = {
+  teacherFull: db.prepare("SELECT id, teacher_code, name, password_hash FROM teachers WHERE teacher_code = ?"),
+  setPassword: db.prepare("UPDATE teachers SET name = ?, password_hash = ? WHERE id = ?"),
+
+  coursesForTeacher: db.prepare("SELECT id, name, section FROM teacher_courses WHERE teacher_id = ? ORDER BY name, section"),
+  insertCourse: db.prepare("INSERT INTO teacher_courses (teacher_id, name, section) VALUES (?, ?, ?)"),
+  courseById: db.prepare("SELECT id, name, section FROM teacher_courses WHERE id = ? AND teacher_id = ?"),
+  deleteCourse: db.prepare("DELETE FROM teacher_courses WHERE id = ? AND teacher_id = ?"),
+
+  insertTeacherSession: db.prepare(
+    "INSERT INTO sessions (class_id, teacher_id, course_name, course_section, hours) VALUES (?, ?, ?, ?, ?)"
+  ),
+  sessionOwner: db.prepare("SELECT teacher_id FROM sessions WHERE id = ?"),
+  liveForTeacher: db.prepare(`
+    SELECT ${SESSION_COLS}
+    FROM sessions s JOIN classes c ON c.id = s.class_id
+    WHERE s.teacher_id = ? AND s.status = 'active' ORDER BY s.id DESC LIMIT 1
+  `),
+  sessionsForTeacher: db.prepare(`
+    SELECT ${SESSION_COLS},
+      (SELECT COUNT(*) FROM attendance WHERE session_id = s.id) AS present_count
+    FROM sessions s JOIN classes c ON c.id = s.class_id
+    WHERE s.teacher_id = ? ORDER BY s.id DESC LIMIT 200
+  `),
+  sessionsForCourse: db.prepare(`
+    SELECT ${SESSION_COLS},
+      (SELECT COUNT(*) FROM attendance WHERE session_id = s.id) AS present_count
+    FROM sessions s JOIN classes c ON c.id = s.class_id
+    WHERE s.teacher_id = ? AND s.course_name = ? AND s.course_section = ?
+    ORDER BY s.id DESC LIMIT 200
+  `),
+  oneSession: db.prepare(`
+    SELECT ${SESSION_COLS}
+    FROM sessions s JOIN classes c ON c.id = s.class_id
+    WHERE s.id = ? AND s.teacher_id = ?
+  `),
+  records: db.prepare(`
+    SELECT st.roll_no, st.name, a.marked_at
+    FROM attendance a JOIN students st ON st.id = a.student_id
+    WHERE a.session_id = ? ORDER BY a.marked_at
+  `),
+};
+
+const makeTeacherToken = (t) =>
+  jwt.sign({ role: "teacher", tid: t.id, code: t.teacher_code, name: t.name }, JWT_SECRET, { expiresIn: "30d" });
+
+function requireTeacher(req, res, next) {
+  try {
+    const t = (req.headers.authorization || "").replace("Bearer ", "");
+    const p = jwt.verify(t, JWT_SECRET);
+    if (p.role !== "teacher") throw new Error("not a teacher token");
+    req.teacher = p;
+    next();
+  } catch {
+    res.status(401).json({ error: "Teacher login required. Please log in again." });
+  }
+}
+
+// Stop QR rotation and close the session
+function stopSession(sessionId) {
+  const state = activeQr.get(sessionId);
+  if (state) {
+    clearInterval(state.rotateHandle);
+    activeQr.delete(sessionId);
+  }
+  q.endSession.run(sessionId);
+}
+
+// Returns the session row if it belongs to the logged-in teacher, else sends an error
+function ownSession(req, res, sessionId) {
+  const row = q.sessionById.get(sessionId);
+  if (!row) { res.status(404).json({ error: "session not found" }); return null; }
+  const owner = tq.sessionOwner.get(sessionId);
+  if (!owner || owner.teacher_id !== req.teacher.tid) {
+    res.status(403).json({ error: "This session belongs to another teacher" });
+    return null;
+  }
+  return row;
+}
+
+// ---- Teacher auth ----
+app.post("/teacher/register", async (req, res) => {
+  const code = String(req.body.teacherCode || "").trim().toUpperCase();
+  const password = String(req.body.password || "");
+
+  if (!TEACHER_ROSTER[code]) return res.status(400).json({ error: "Invalid teacher code" });
+  if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+
+  const id = getOrCreateTeacher(code);
+  const row = tq.teacherFull.get(code);
+  if (row.password_hash) return res.status(409).json({ error: "Account already exists. Please log in." });
+
+  tq.setPassword.run(TEACHER_ROSTER[code], await bcrypt.hash(password, 10), id);
+  const t = tq.teacherFull.get(code);
+  res.json({ token: makeTeacherToken(t), teacher: { code: t.teacher_code, name: t.name } });
+});
+
+app.post("/teacher/login", async (req, res) => {
+  const code = String(req.body.teacherCode || "").trim().toUpperCase();
+  const password = String(req.body.password || "");
+
+  const row = tq.teacherFull.get(code);
+  if (!row || !row.password_hash) {
+    return TEACHER_ROSTER[code]
+      ? res.status(404).json({ error: "No account yet. Create one first.", needsRegister: true })
+      : res.status(404).json({ error: "Invalid teacher code" });
+  }
+  if (!(await bcrypt.compare(password, row.password_hash))) {
+    return res.status(401).json({ error: "Wrong password" });
+  }
+  res.json({ token: makeTeacherToken(row), teacher: { code: row.teacher_code, name: row.name } });
+});
+
+// ---- Teacher courses (add whenever a new class is assigned) ----
+app.get("/teacher/courses", requireTeacher, (req, res) => {
+  res.json({ courses: tq.coursesForTeacher.all(req.teacher.tid) });
+});
+
+app.post("/teacher/courses", requireTeacher, (req, res) => {
+  const name = String((req.body || {}).name || "").trim();
+  const section = String((req.body || {}).section || "").trim().toUpperCase();
+
+  if (name.length < 2 || name.length > 60) return res.status(400).json({ error: "Enter a course name (2-60 characters)" });
+  if (section.length < 1 || section.length > 20) return res.status(400).json({ error: "Enter branch and section, e.g. CSE-B" });
+
+  try {
+    const id = Number(tq.insertCourse.run(req.teacher.tid, name, section).lastInsertRowid);
+    res.json({ course: { id, name, section } });
+  } catch (e) {
+    if (String(e.message).includes("UNIQUE")) return res.status(409).json({ error: "You already added this course and section" });
+    console.error(e);
+    res.status(500).json({ error: "Could not save course" });
+  }
+});
+
+app.delete("/teacher/courses/:id", requireTeacher, (req, res) => {
+  const r = tq.deleteCourse.run(Number(req.params.id), req.teacher.tid);
+  if (r.changes === 0) return res.status(404).json({ error: "Course not found" });
+  res.json({ ok: true }); // past sessions keep their course name/section
+});
+
+// ---- Teacher: check attendance any time ----
+app.get("/teacher/live", requireTeacher, (req, res) => {
+  const session = tq.liveForTeacher.get(req.teacher.tid);
+  if (!session) return res.json({ active: false });
+  const records = tq.records.all(session.id);
+  res.json({ active: true, session, count: records.length, records });
+});
+
+// History: only ONE class if courseName + section are sent, otherwise all classes
+app.get("/teacher/sessions", requireTeacher, (req, res) => {
+  const courseName = String(req.query.courseName || "").trim();
+  const section = String(req.query.section || "").trim();
+
+  const rows =
+    courseName && section
+      ? tq.sessionsForCourse.all(req.teacher.tid, courseName, section)
+      : tq.sessionsForTeacher.all(req.teacher.tid);
+
+  const sessions = rows.map((s) => ({
+    ...s,
+    students: tq.records.all(s.id).sort((a, b) => a.roll_no.localeCompare(b.roll_no)),
+  }));
+  res.json({ sessions });
+});
+
+// Attendance % per student for ONE class = hours attended / total hours
+app.get("/teacher/class-stats", requireTeacher, (req, res) => {
+  const courseName = String(req.query.courseName || "").trim();
+  const section = String(req.query.section || "").trim();
+  if (!courseName || !section) {
+    return res.status(400).json({ error: "courseName and section are required" });
+  }
+
+  // only finished sessions count
+  const totals = db
+    .prepare(
+      `SELECT COUNT(*) AS sessions, COALESCE(SUM(hours), 0) AS hours
+       FROM sessions
+       WHERE teacher_id = ? AND course_name = ? AND course_section = ?
+         AND status <> 'active'`
+    )
+    .get(req.teacher.tid, courseName, section);
+
+  const rows = db
+    .prepare(
+      `SELECT st.roll_no,
+              COUNT(DISTINCT a.session_id) AS sessions_attended,
+              COALESCE(SUM(s.hours), 0) AS hours_attended
+       FROM attendance a
+       JOIN sessions s ON s.id = a.session_id
+       JOIN students st ON st.id = a.student_id
+       WHERE s.teacher_id = ? AND s.course_name = ? AND s.course_section = ?
+         AND s.status <> 'active'
+       GROUP BY st.id
+       ORDER BY st.roll_no`
+    )
+    .all(req.teacher.tid, courseName, section);
+
+  const students = rows.map((r) => ({
+    roll_no: r.roll_no,
+    attendedSessions: r.sessions_attended,
+    attendedHours: Math.round(r.hours_attended * 100) / 100,
+    percentage: totals.hours ? Math.round((r.hours_attended / totals.hours) * 1000) / 10 : 0,
+  }));
+
+  res.json({
+    courseName,
+    section,
+    totalSessions: totals.sessions,
+    totalHours: Math.round(totals.hours * 100) / 100,
+    students,
+  });
+});
+
+app.get("/teacher/sessions/:id", requireTeacher, (req, res) => {
+  const session = tq.oneSession.get(Number(req.params.id), req.teacher.tid);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  const records = tq.records.all(session.id).sort((a, b) => a.roll_no.localeCompare(b.roll_no));
+  res.json({ session, count: records.length, records });
+});
+
+// ---- Session routes (teacher-protected) ----
 app.get("/ping", (req, res) => {
   res.json({ ok: true, time: Date.now() });
 });
 
-// Professor taps "Start Session" -> opens a session and starts rotating QR.
-app.post("/session/start", async (req, res) => {
-  const { teacherId, classId } = req.body || {};
+// Teacher taps "Start Session" for one of their courses (with its duration in hours)
+app.post("/session/start", requireTeacher, async (req, res) => {
+  const courseId = Number((req.body || {}).courseId);
+  if (!courseId) return res.status(400).json({ error: "courseId is required" });
 
-  if (!teacherId || !classId) {
-    return res.status(400).json({ error: "teacherId and classId are required" });
+  const hours = Number((req.body || {}).hours);
+  if (!(hours > 0 && hours <= 12)) {
+    return res.status(400).json({ error: "Enter the session duration in hours (0.5 to 12)" });
   }
 
-  const teacherDbId = getOrCreateTeacher(String(teacherId));
-  const classDbId = getOrCreateClass(String(classId), teacherDbId);
-  const sessionId = Number(q.insertSession.run(classDbId).lastInsertRowid);
+  const course = tq.courseById.get(courseId, req.teacher.tid);
+  if (!course) return res.status(404).json({ error: "Course not found" });
 
-  const state = {
-    qrToken: null,
-    qrDataUrl: null,
-    qrIssuedAt: null,
-    rotateHandle: null,
-  };
+  // If this teacher left an old session running, close it first
+  const old = tq.liveForTeacher.get(req.teacher.tid);
+  if (old) stopSession(old.id);
+
+  const classDbId = getOrCreateClass(`COURSE-${course.id}`, req.teacher.tid);
+  const sessionId = Number(
+    tq.insertTeacherSession.run(classDbId, req.teacher.tid, course.name, course.section, hours).lastInsertRowid
+  );
+
+  const state = { qrToken: null, qrDataUrl: null, qrIssuedAt: null, rotateHandle: null };
   activeQr.set(sessionId, state);
 
   await rotateQr(sessionId, state);
@@ -415,129 +684,4 @@ app.post("/session/start", async (req, res) => {
     rotateIntervalMs: QR_ROTATE_INTERVAL_MS,
     qrIssuedAt: state.qrIssuedAt,
   });
-});
-
-// Teacher screen polls this every 5s to pick up the current QR image.
-app.get("/session/qr", (req, res) => {
-  const sessionId = Number(req.query.sessionId);
-  const row = q.sessionById.get(sessionId);
-
-  if (!row) {
-    return res.status(404).json({ error: "session not found" });
-  }
-  const state = activeQr.get(sessionId);
-  if (row.status !== "active" || !state) {
-    return res.status(410).json({ error: "session has ended" });
-  }
-
-  const msRemaining = QR_ROTATE_INTERVAL_MS - (Date.now() - state.qrIssuedAt);
-
-  res.json({
-    qrDataUrl: state.qrDataUrl,
-    qrIssuedAt: state.qrIssuedAt,
-    msUntilNextRotation: Math.max(0, msRemaining),
-  });
-});
-
-// Student app scans the QR and posts back the token it decoded.
-// The student is identified by their login token (req.user.roll), not the request body.
-app.post("/attendance/mark", requireAuth, (req, res) => {
-  const { sessionId: rawSessionId, token } = req.body || {};
-
-  if (!rawSessionId || !token) {
-    return res.status(400).json({ error: "sessionId and token are required" });
-  }
-
-  const sessionId = Number(rawSessionId);
-  const row = q.sessionById.get(sessionId);
-  const state = activeQr.get(sessionId);
-  if (!row || row.status !== "active" || !state) {
-    return res.status(404).json({ error: "session not found or ended" });
-  }
-
-  if (token !== state.qrToken) {
-    // Stale (already rotated) or spoofed/screenshotted QR.
-    return res.status(409).json({ error: "QR token expired or invalid" });
-  }
-
-  const student = q.studentByRoll.get(req.user.roll);
-  if (!student) {
-    return res.status(404).json({ error: "student not found" });
-  }
-
-  // UNIQUE(session_id, student_id) makes a repeat insert a no-op.
-  const result = q.insertAttendance.run(sessionId, student.id);
-  res.json({
-    ok: true,
-    alreadyMarked: result.changes === 0,
-    student: { rollNo: student.roll_no, name: student.name },
-  });
-});
-
-// Status the teacher dashboard can poll for a live headcount.
-app.get("/session/status", (req, res) => {
-  const sessionId = Number(req.query.sessionId);
-  const row = q.sessionById.get(sessionId);
-
-  if (!row) {
-    return res.status(404).json({ error: "session not found" });
-  }
-
-  const present = q.attendanceForSession.all(sessionId);
-
-  res.json({
-    sessionId,
-    active: row.status === "active",
-    classId: row.class_code,
-    teacherId: row.teacher_code,
-    presentCount: present.length,
-    presentStudentIds: present.map((p) => p.rollNo),
-    presentStudents: present,
-  });
-});
-
-// Professor taps "End Session" -> stop rotating, freeze final headcount.
-app.post("/session/end", (req, res) => {
-  const sessionId = Number((req.body || {}).sessionId);
-  const row = q.sessionById.get(sessionId);
-
-  if (!row) {
-    return res.status(404).json({ error: "session not found" });
-  }
-
-  const state = activeQr.get(sessionId);
-  if (state) {
-    clearInterval(state.rotateHandle);
-    activeQr.delete(sessionId);
-  }
-  q.endSession.run(sessionId);
-
-  const present = q.attendanceForSession.all(sessionId);
-
-  res.json({
-    ok: true,
-    sessionId,
-    presentCount: present.length,
-    presentStudentIds: present.map((p) => p.rollNo),
-    presentStudents: present,
-  });
-});
-
-// TEST ONLY: mark a student present without scanning. Off unless ALLOW_TEST_MARK=1.
-if (process.env.ALLOW_TEST_MARK === "1") {
-  const latestActive = db.prepare(
-    "SELECT id FROM sessions WHERE status = 'active' ORDER BY id DESC LIMIT 1"
-  );
-  app.get("/dev/mark", (req, res) => {
-    const active = latestActive.get();
-    if (!active) return res.status(404).json({ error: "no active session" });
-    const student = q.studentByRoll.get(String(req.query.roll || "").trim().toUpperCase());
-    if (!student) return res.status(404).json({ error: "student not found" });
-    const r = q.insertAttendance.run(active.id, student.id);
-    res.json({ ok: true, alreadyMarked: r.changes === 0, student: student.roll_no });
-  });
-}
-
-app.listen(PORT, () => {
-  console.log(`Attendance backend listening on http://localhost:${PORT}`);
 });
